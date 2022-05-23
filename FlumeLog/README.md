@@ -28,3 +28,5 @@ a1.channels.c1.parseAsFlumeEvent = false
 #绑定source和channel以及sink和channel的关系
 a1.sources.r1.channels = c1
 ```
+[LogInterceptor](../Demo/src/main/java/com/flume/interceptor/LogInterceptor.java)
+> 自定义拦截器，过滤不满足json格式的数据
