@@ -281,3 +281,214 @@ esac
 > 测试同步脚本， 查看HDFS文件生成结果
 
 `mysql_to_hdfs_full.sh all 2020-06-14`
+
+## 增量数据同步
+
+### Maxwell
+
+#### 部署
+- 下载安装包：`https://github.com/zendesk/maxwell/releases/download/v1.29.2/maxwell-1.29.2.tar.gz`
+- 解压：`tar -zxvf maxwell-1.29.2.tar.gz -C /opt/module/`
+- 启用MySQL Binlog，修改配置文件`/etc/my.cnf`
+```
+[mysqld]
+
+#数据库id
+server-id = 1
+#启动binlog，该参数的值会作为binlog的文件名
+log-bin=mysql-bin
+#binlog类型，maxwell要求为row类型
+binlog_format=row
+#启用binlog的数据库，需根据实际情况作出修改
+binlog-do-db=gmall
+```
+- 创建maxwell所需数据库和用户
+```sql
+CREATE DATABASE maxwell;
+CREATE USER 'maxwell'@'%' IDENTIFIED BY 'maxwell';
+GRANT ALL ON maxwell.* TO 'maxwell'@'%';
+GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'maxwell'@'%';
+```
+#### 配置Maxwell
+> 修改配置文件config.properties
+```properties
+log_level=info
+
+producer=kafka
+kafka.bootstrap.servers=hadoop101:9092,hadoop102:9092
+
+#kafka topic动态配置
+kafka_topic=%{table}
+# mysql login info
+host=hadoop100
+user=maxwell
+password=maxwell
+jdbc_options=useSSL=false&serverTimezone=Asia/Shanghai
+
+#表过滤，只同步特定的13张表
+filter= include:gmall.cart_info,include:gmall.comment_info,include:gmall.coupon_use,include:gmall.favor_info,include:gmall.order_detail,include:gmall.order_detail_activity,include:gmall.order_detail_coupon,include:gmall.order_info,include:gmall.order_refund_info,include:gmall.order_status_log,include:gmall.payment_info,include:gmall.refund_payment,include:gmall.user_info
+```
+#### Maxwell启停
+```sh
+#!/bin/bash
+
+MAXWELL_HOME=/opt/module/maxwell
+
+status_maxwell(){
+    result=`ps -ef | grep maxwell | grep -v grep | wc -l`
+    return $result
+}
+
+
+start_maxwell(){
+    status_maxwell
+    if [[ $? -lt 1 ]]; then
+        echo "启动Maxwell"
+        $MAXWELL_HOME/bin/maxwell --config $MAXWELL_HOME/config.properties --daemon
+    else
+        echo "Maxwell正在运行"
+    fi
+}
+
+
+stop_maxwell(){
+    status_maxwell
+    if [[ $? -gt 0 ]]; then
+        echo "停止Maxwell"
+        ps -ef | grep maxwell | grep -v grep | awk '{print $2}' | xargs kill -9
+    else
+        echo "Maxwell未在运行"
+    fi
+}
+
+
+case $1 in
+    start )
+        start_maxwell
+    ;;
+    stop )
+        stop_maxwell
+    ;;
+    restart )
+       stop_maxwell
+       start_maxwell
+    ;;
+esac
+```
+#### Flume配置
+> 将不同的增量表对应kafka的topic数据同步到HDFS
+- [自定义拦截器](../Demo/src/main/java/com/flume/interceptor/MyTimeStampInterceptor.java)，放到flume对应的lib文件夹下
+```properties
+a1.sources = r1
+a1.channels = c1
+a1.sinks = k1
+
+a1.sources.r1.type = org.apache.flume.source.kafka.KafkaSource
+a1.sources.r1.batchSize = 5000
+a1.sources.r1.batchDurationMillis = 2000
+a1.sources.r1.kafka.bootstrap.servers = hadoop102:9092,hadoop103:9092
+a1.sources.r1.kafka.topics = cart_info,comment_info,coupon_use,favor_info,order_detail_activity,order_detail_coupon,order_detail,order_info,order_refund_info,order_status_log,payment_info,refund_payment,user_info
+a1.sources.r1.kafka.consumer.group.id = flume
+a1.sources.r1.setTopicHeader = true
+a1.sources.r1.topicHeader = topic
+a1.sources.r1.interceptors = i1
+a1.sources.r1.interceptors.i1.type = com.atguigu.flume.interceptor.db.TimestampInterceptor$Builder
+
+
+a1.channels.c1.type = file
+a1.channels.c1.checkpointDir = /opt/module/flume/checkpoint/behavior2
+a1.channels.c1.dataDirs = /opt/module/flume/data/behavior2/
+a1.channels.c1.maxFileSize = 2146435071
+a1.channels.c1.capacity = 1123456
+a1.channels.c1.keep-alive = 6
+
+## sink1
+a1.sinks.k1.type = hdfs
+a1.sinks.k1.hdfs.path = /origin_data/gmall/db/%{topic}_inc/%Y-%m-%d
+a1.sinks.k1.hdfs.filePrefix = db
+a1.sinks.k1.hdfs.round = false
+
+
+a1.sinks.k1.hdfs.rollInterval = 10
+a1.sinks.k1.hdfs.rollSize = 134217728
+a1.sinks.k1.hdfs.rollCount = 0
+
+
+a1.sinks.k1.hdfs.fileType = CompressedStream
+a1.sinks.k1.hdfs.codeC = gzip
+
+## 拼装
+a1.sources.r1.channels = c1
+a1.sinks.k1.channel= c1
+```
+
+#### 增量表首日全量数据同步
+> 全量同步使用Maxwell的bootstrap功能
+```sh
+#!/bin/bash
+
+# 该脚本的作用是初始化所有的增量表，只需执行一次
+
+MAXWELL_HOME=/opt/module/maxwell
+
+import_data() {
+    $MAXWELL_HOME/bin/maxwell-bootstrap --database gmall --table $1 --config $MAXWELL_HOME/config.properties
+}
+
+case $1 in
+"cart_info")
+  import_data cart_info
+  ;;
+"comment_info")
+  import_data comment_info
+  ;;
+"coupon_use")
+  import_data coupon_use
+  ;;
+"favor_info")
+  import_data favor_info
+  ;;
+"order_detail")
+  import_data order_detail
+  ;;
+"order_detail_activity")
+  import_data order_detail_activity
+  ;;
+"order_detail_coupon")
+  import_data order_detail_coupon
+  ;;
+"order_info")
+  import_data order_info
+  ;;
+"order_refund_info")
+  import_data order_refund_info
+  ;;
+"order_status_log")
+  import_data order_status_log
+  ;;
+"payment_info")
+  import_data payment_info
+  ;;
+"refund_payment")
+  import_data refund_payment
+  ;;
+"user_info")
+  import_data user_info
+  ;;
+"all")
+  import_data cart_info
+  import_data comment_info
+  import_data coupon_use
+  import_data favor_info
+  import_data order_detail
+  import_data order_detail_activity
+  import_data order_detail_coupon
+  import_data order_info
+  import_data order_refund_info
+  import_data order_status_log
+  import_data payment_info
+  import_data refund_payment
+  import_data user_info
+  ;;
+esac
+```
